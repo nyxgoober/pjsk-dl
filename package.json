@@ -1,0 +1,23 @@
+{
+  "name": "pjsk-dl",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "bin": {
+    "pjsk-id": "./index.js"
+  },
+  "scripts": {
+    "build": "pkg . --targets node18-linux-x64,node18-linux-arm64,node18-macos-x64,node18-macos-arm64,node18-win-x64,node18-win-arm64 --out-path dist",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "prompts": "^2.4.2"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}

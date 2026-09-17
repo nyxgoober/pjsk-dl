@@ -25,8 +25,8 @@ Grab the binary for your platform from the [Releases](https://github.com/nyxgoob
 
 | Platform | File |
 |---|---|
-| Linux (x64) | `pjsk-dl-linux-x64` |
-| Linux (ARM64) | `pjsk-dl-linux-arm64` |
+| Linux (x64) | `pjsk-dl-linuxstatic-x64` |
+| Linux (ARM64) | `pjsk-dl-linuxstatic-arm64` |
 | macOS (Intel) | `pjsk-dl-macos-x64` |
 | macOS (Apple Silicon) | `pjsk-dl-macos-arm64` |
 | Windows (x64) | `pjsk-dl-win-x64.exe` |

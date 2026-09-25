@@ -3,9 +3,14 @@ const prompts = require("prompts");
 const chalk = require("chalk");
 const fs = require("fs");
 const path = require("path");
+const { trimWav } = require("./wavtrim");
+const { trimMp3 } = require("./mp3trim");
+const { trimFlac } = require("./flactrim");
 
 const MUSICS_URL = "https://sekai-world.github.io/sekai-master-db-diff/musics.json";
 const VOCALS_URL = "https://sekai-world.github.io/sekai-master-db-diff/musicVocals.json";
+const GAME_CHARS_URL = "https://sekai-world.github.io/sekai-master-db-diff/gameCharacters.json";
+const OUTSIDE_CHARS_URL = "https://sekai-world.github.io/sekai-master-db-diff/outsideCharacters.json";
 
 async function fetchJson(url, label) {
   const res = await fetch(url);
@@ -64,6 +69,40 @@ function getVocalsForSong(musicId, vocals) {
   return vocals.filter((v) => v.musicId === musicId);
 }
 
+// Build id -> display name lookups from the character master tables.
+function buildCharacterLookup(gameChars, outsideChars) {
+  const game = new Map();
+  for (const c of gameChars) {
+    const name = [c.givenNameEnglish, c.firstNameEnglish]
+      .filter(Boolean)
+      .map((s) => s.charAt(0) + s.slice(1).toLowerCase())
+      .join(" ");
+    // Use the given name only (e.g. "Ichika"), which is how fans refer to them.
+    const given = c.givenNameEnglish
+      ? c.givenNameEnglish.charAt(0) + c.givenNameEnglish.slice(1).toLowerCase()
+      : name;
+    game.set(c.id, given || `#${c.id}`);
+  }
+  const outside = new Map();
+  for (const c of outsideChars) outside.set(c.id, c.name);
+  return { game, outside };
+}
+
+function characterName(ch, lookup) {
+  if (ch.characterType === "outside_character") {
+    return lookup.outside.get(ch.characterId) || `outside#${ch.characterId}`;
+  }
+  return lookup.game.get(ch.characterId) || `char#${ch.characterId}`;
+}
+
+function singersFor(vocal, lookup) {
+  return (vocal.characters || [])
+    .slice()
+    .sort((a, b) => a.seq - b.seq)
+    .map((ch) => characterName(ch, lookup))
+    .join(", ");
+}
+
 function printResult(song, vocals) {
   console.log(chalk.bold(`\n${song.title}`));
   console.log(chalk.green(`  id: ${song.id}`));
@@ -76,36 +115,42 @@ function printResult(song, vocals) {
   console.log();
 }
 
-const VOCAL_PREFIXES = {
-  "SEKAI cover": "se",
-  "Virtual Singer": "vs",
-};
 const FORMAT_INFO = {
   mp3: "common, lossy",
   wav: "uncompressed",
   flac: "lossless",
 };
 const SUPPORTED_FORMATS = ["mp3", "wav", "flac"];
+const TRIM_SECONDS = 8;
 const DOWNLOAD_BASE = "https://storage.sekai.best/sekai-jp-assets/music/long";
 
-function padSongId(id) {
-  return String(id).padStart(4, "0");
-}
+// Human-readable labels for each musicVocalType in the master data.
+const VOCAL_TYPE_LABELS = {
+  original_song: "Original",
+  sekai: "SEKAI cover",
+  virtual_singer: "Virtual Singer",
+  another_vocal: "Another Vocal",
+  streaming_live: "Streaming Live",
+  april_fool_2022: "April Fool 2022",
+  instrumental: "Instrumental",
+};
 
-function buildDownloadUrl(prefix, songId, format) {
-  const padded = padSongId(songId);
-  const bundle = `${prefix}_${padded}_01`;
-  const filename = `${prefix}_${padded}_01.${format}`;
-  return `${DOWNLOAD_BASE}/${bundle}/${filename}`;
-}
+// Order used when listing variants in the menu.
+const VOCAL_TYPE_ORDER = [
+  "original_song",
+  "sekai",
+  "virtual_singer",
+  "another_vocal",
+  "streaming_live",
+  "april_fool_2022",
+  "instrumental",
+];
 
-// Songs with only one vocal type have no se_/vs_ prefix at all —
-// just songid_01.format.
-function buildNoPrefixUrl(songId, format) {
-  const padded = padSongId(songId);
-  const bundle = `${padded}_01`;
-  const filename = `${padded}_01.${format}`;
-  return `${DOWNLOAD_BASE}/${bundle}/${filename}`;
+// The master data gives us the exact asset bundle name for every vocal
+// (e.g. "an_0006_01", "0006_02", "vs_0052_02"), so we use it directly
+// instead of guessing a prefix.
+function buildDownloadUrl(assetbundleName, format) {
+  return `${DOWNLOAD_BASE}/${assetbundleName}/${assetbundleName}.${format}`;
 }
 
 async function checkUrlExists(url) {
@@ -122,30 +167,63 @@ async function checkUrlExists(url) {
   }
 }
 
-async function downloadFile(url, destPath) {
+async function fetchBuffer(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  fs.writeFileSync(destPath, buf);
-  return destPath;
+  return Buffer.from(await res.arrayBuffer());
 }
 
-async function offerDownload(song) {
+// Turn a song's vocal entries into menu choices. Another Vocals get one
+// entry each, labelled with the singer(s) from the character mapping.
+function buildVocalChoices(song, vocals, lookup) {
+  const songVocals = getVocalsForSong(song.id, vocals)
+    .filter((v) => v.assetbundleName)
+    .sort((a, b) => {
+      const ta = VOCAL_TYPE_ORDER.indexOf(a.musicVocalType);
+      const tb = VOCAL_TYPE_ORDER.indexOf(b.musicVocalType);
+      return (ta === -1 ? 99 : ta) - (tb === -1 ? 99 : tb) || a.seq - b.seq;
+    });
+
+  return songVocals.map((v) => {
+    const label = VOCAL_TYPE_LABELS[v.musicVocalType] || v.musicVocalType;
+    const singers = singersFor(v, lookup);
+    // Bundle name goes in the row itself so every entry shows it, not just
+    // the highlighted one.
+    return {
+      title: `${singers ? `${label} — ${singers}` : label} - ${v.assetbundleName}`,
+      value: v,
+    };
+  });
+}
+
+// Trimmers by format. WAV skips PCM samples; MP3 and FLAC drop whole frames.
+const TRIMMERS = { wav: trimWav, mp3: trimMp3, flac: trimFlac };
+
+// Ask every question up front. Returns null if the user backs out; otherwise
+// a plan describing exactly what will be downloaded. Nothing touches the
+// network until the plan has been confirmed.
+async function askDownloadPlan(song, vocals, lookup) {
+  const choices = buildVocalChoices(song, vocals, lookup);
+
+  if (choices.length === 0) {
+    console.log(
+      chalk.yellow(`No vocal entries listed in the master data for "${song.title}".\n`)
+    );
+    return null;
+  }
+
+  choices.push({ title: "(skip download)", value: null });
+
   const { vocalChoice } = await prompts(
     {
       type: "select",
       name: "vocalChoice",
       message: "Which vocal version?",
-      choices: [
-        { title: "SEKAI cover", value: "SEKAI cover" },
-        { title: "Virtual Singer", value: "Virtual Singer" },
-        { title: "(skip download)", value: null },
-      ],
+      choices,
     },
     { onCancel: () => process.exit(0) }
   );
-
-  if (!vocalChoice) return;
+  if (!vocalChoice) return null;
 
   const { format } = await prompts(
     {
@@ -160,54 +238,136 @@ async function offerDownload(song) {
     { onCancel: () => process.exit(0) }
   );
 
-  const prefix = VOCAL_PREFIXES[vocalChoice];
-  let url = buildDownloadUrl(prefix, song.id, format);
+  let trim = false;
+  if (TRIMMERS[format]) {
+    ({ trim } = await prompts(
+      {
+        type: "confirm",
+        name: "trim",
+        message: `Trim the first ${TRIM_SECONDS} seconds?`,
+        initial: false,
+      },
+      { onCancel: () => process.exit(0) }
+    ));
+  }
+
+  const url = buildDownloadUrl(vocalChoice.assetbundleName, format);
+  const base = path.basename(url);
+  const filename = base;
+  const destPath = path.join(process.cwd(), filename);
+
+  const plan = { song, vocalChoice, format, trim, url, filename, destPath };
+
+  // Summary, then the last chance to back out before any download starts.
+  const label = VOCAL_TYPE_LABELS[vocalChoice.musicVocalType] || vocalChoice.musicVocalType;
+  const singers = singersFor(vocalChoice, lookup);
+  console.log(chalk.bold("\nAbout to download:"));
+  console.log(`  Song:    ${song.title}`);
+  console.log(`  Vocal:   ${label}${singers ? ` — ${singers}` : ""}`);
+  console.log(`  Format:  ${format.toUpperCase()}${trim ? `, first ${TRIM_SECONDS}s trimmed` : ""}`);
+  console.log(`  Saves:   ${destPath}`);
+  console.log();
+
+  // If the file is already there, ask before anything is downloaded. Defaults
+  // to "no" so a stray Enter can't replace a file the user already has.
+  if (fs.existsSync(destPath)) {
+    const { overwrite } = await prompts(
+      {
+        type: "confirm",
+        name: "overwrite",
+        message: `${filename} already exists. Overwrite it?`,
+        initial: false,
+      },
+      { onCancel: () => process.exit(0) }
+    );
+    if (!overwrite) return null;
+  }
+
+  const { proceed } = await prompts(
+    {
+      type: "confirm",
+      name: "proceed",
+      message: "Download?",
+      initial: true,
+    },
+    { onCancel: () => process.exit(0) }
+  );
+
+  return proceed ? plan : null;
+}
+
+// Runs the confirmed plan: check the file exists, download it, trim if asked.
+async function runDownloadPlan(plan) {
+  const { song, vocalChoice, format, trim, url, destPath } = plan;
+  const label = VOCAL_TYPE_LABELS[vocalChoice.musicVocalType] || vocalChoice.musicVocalType;
 
   console.log(chalk.dim(`\nChecking ${url} ...`));
-  let exists = await checkUrlExists(url);
-
-  if (!exists) {
-    // Songs with only one vocal variant don't use a se_/vs_ prefix at all.
-    const fallbackUrl = buildNoPrefixUrl(song.id, format);
-    console.log(chalk.dim(`Not found. Checking ${fallbackUrl} ...`));
-    const fallbackExists = await checkUrlExists(fallbackUrl);
-    if (fallbackExists) {
-      url = fallbackUrl;
-      exists = true;
-    }
-  }
+  const exists = await checkUrlExists(url);
 
   if (!exists) {
     console.log(
       chalk.red(
-        `\nNo ${vocalChoice} (${format}) version found for "${song.title}". ` +
-          `This song may not have that vocal variant, or it may not exist in this format.\n`
+        `\nNo ${label} (${format}) file found for "${song.title}" at ${vocalChoice.assetbundleName}. ` +
+          `It may not exist in this format.\n`
       )
     );
     return;
   }
 
-  const filename = path.basename(url);
-  const destPath = path.join(process.cwd(), filename);
-
+  let data;
   try {
     console.log(chalk.dim(`Downloading to ${destPath} ...`));
-    await downloadFile(url, destPath);
-    console.log(chalk.green(`Saved: ${destPath}\n`));
+    data = await fetchBuffer(url);
   } catch (err) {
     console.log(chalk.red(`\nDownload failed: ${err.message}\n`));
+    return;
   }
+
+  // Trimming is best-effort: if it can't be done, save the untrimmed file
+  // rather than throwing away a completed download.
+  if (trim) {
+    try {
+      const { buffer, info } = TRIMMERS[format](data, TRIM_SECONDS);
+      data = buffer;
+      const cut = info.cutSeconds !== undefined ? info.cutSeconds : TRIM_SECONDS;
+      console.log(chalk.dim(`Trimmed ${cut.toFixed(3)}s, ${info.remainingSeconds.toFixed(1)}s remaining.`));
+    } catch (err) {
+      console.log(chalk.yellow(`Couldn't trim (${err.message}); saving the untrimmed file instead.`));
+    }
+  }
+
+  try {
+    fs.writeFileSync(destPath, data);
+    console.log(chalk.green(`Saved: ${destPath}\n`));
+  } catch (err) {
+    console.log(chalk.red(`\nCouldn't save file: ${err.message}\n`));
+  }
+}
+
+async function offerDownload(song, vocals, lookup) {
+  const plan = await askDownloadPlan(song, vocals, lookup);
+  if (!plan) {
+    console.log(chalk.dim("Skipped.\n"));
+    return;
+  }
+  await runDownloadPlan(plan);
 }
 
 async function main() {
   console.log(chalk.bold.cyan("\n♪ PJSK-DL ♪\n"));
 
-  let songs, vocals;
+  let songs, vocals, lookup;
   try {
     console.log(chalk.dim("Fetching master music data.."));
     songs = await fetchJson(MUSICS_URL, "musics.json");
     console.log(chalk.dim("Fetching music vocals..."));
     vocals = await fetchJson(VOCALS_URL, "musicVocals.json");
+    console.log(chalk.dim("Fetching characters..."));
+    const [gameChars, outsideChars] = await Promise.all([
+      fetchJson(GAME_CHARS_URL, "gameCharacters.json"),
+      fetchJson(OUTSIDE_CHARS_URL, "outsideCharacters.json"),
+    ]);
+    lookup = buildCharacterLookup(gameChars, outsideChars);
     console.log(chalk.green(`Loaded ${songs.length} songs, ${vocals.length} vocal entries.\n`));
   } catch (err) {
     console.error(chalk.red(`\nError loading data: ${err.message}`));
@@ -233,7 +393,7 @@ async function main() {
       console.log(chalk.red("No matches found.\n"));
     } else if (matches.length === 1) {
       printResult(matches[0], vocals);
-      await offerDownload(matches[0]);
+      await offerDownload(matches[0], vocals, lookup);
     } else {
       const top = matches.slice(0, 10);
       const { chosen } = await prompts(
@@ -251,7 +411,7 @@ async function main() {
       );
       if (chosen) {
         printResult(chosen, vocals);
-        await offerDownload(chosen);
+        await offerDownload(chosen, vocals, lookup);
       }
     }
 
